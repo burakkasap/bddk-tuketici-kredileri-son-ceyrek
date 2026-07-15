@@ -1,0 +1,13 @@
+# Downloaded report cache (can be gigabytes) — regenerated on run
+bddk_cache/
+# OCR page renders and generated per-quarter outputs
+_ocr_pages/
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store

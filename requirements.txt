@@ -1,0 +1,7 @@
+# Dependencies for the historical backfill script (bddk_consolidated_loans.py).
+# The recurring quarterly tool has its own (adds OCR): see bddk_quarterly/requirements.txt
+requests
+truststore
+openpyxl
+pdfplumber
+python-docx

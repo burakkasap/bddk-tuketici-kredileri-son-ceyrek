@@ -1,0 +1,8 @@
+requests
+truststore
+openpyxl
+pdfplumber
+python-docx
+pymupdf
+rapidocr-onnxruntime
+pillow
