@@ -1,47 +1,41 @@
 #!/usr/bin/env python3
 """
-BDDK Consolidated Bank Report Scraper — Consumer Loan Breakdown
-=================================================================
+BDDK Consolidated Bank Report Scraper — historical backfill
+===========================================================
 
-Downloads consolidated ("Konsolide") independent audit reports for every
-Turkish bank from BDDK's "Bağımsız Denetim Raporları" portal
-(https://www.bddk.gov.tr/BdrUyg), extracts the mandatory "Tüketici
-kredileri ... ilişkin bilgiler" footnote table from each report's PDF,
-and writes the results into an Excel workbook that follows the layout of
+Downloads consolidated ("Konsolide") independent audit reports for Turkish
+banks from BDDK's "Bağımsız Denetim Raporları" portal
+(https://www.bddk.gov.tr/BdrUyg) over a quarter range, extracts the loan
+breakdown footnote tables, and writes an Excel workbook laid out like
 Template.xlsx (one block of rows per bank, one column per quarter).
 
-Fields extracted per bank per quarter (all in thousand TRY, as reported):
-    Tüketici Kredileri-TP  (Toplam)
-        Konut Kredisi
-        Taşıt Kredisi
-        İhtiyaç Kredisi
-        Diğer
-    Tüketici Kredileri-YP  (Toplam)
-        Konut Kredisi
-        Taşıt Kredisi
-        İhtiyaç Kredisi
-        Diğer
+Two tables are supported (see TABLE_SPECS) and are written as SEPARATE
+SHEETS of one workbook, because their sub-items differ:
 
-Rules (per user spec):
-    - If a bank has no consolidated report for a given quarter -> all 10
-      fields for that bank/quarter are 0.
-    - If a field is blank / "-" in the report -> 0.
+  sheet "Tüketici Kredileri"        sheet "Taksitli Ticari Krediler"
+    Tüketici Kredileri-TP             Taksitli Ticari Krediler-TP
+      Konut Kredisi                     İşyeri Kredisi
+      Taşıt Kredisi                     Taşıt Kredisi
+      İhtiyaç Kredisi                   İhtiyaç Kredisi
+      Diğer                             Diğer
+    Tüketici Kredileri-YP             Taksitli Ticari Krediler-YP
+      ... (same four)                   ... (same four)
+
+Only the **Cari Dönem** (current period) table is ever used; each report also
+contains an Önceki Dönem (previous period) copy, which is explicitly excluded
+(see _pick_current_period_tp).
+
+Rules:
+    - Bank has no consolidated report for a quarter -> all fields 0.
+    - Field blank / "-" in the report -> 0.
 
 Usage:
-    python3 bddk_consolidated_loans.py
-    python3 bddk_consolidated_loans.py --banks 5          # limit for a quick test
+    python3 bddk_consolidated_loans.py --only-banks          # 25 banks, both tables
+    python3 bddk_consolidated_loans.py --tables taksitli     # one sheet only
     python3 bddk_consolidated_loans.py --start 2023Q1 --end 2026Q1
-    python3 bddk_consolidated_loans.py --output result.xlsx --cache-dir ./bddk_cache
+    python3 bddk_consolidated_loans.py --banks 5             # quick test
 
-Notes:
-    - Downloaded ZIP/PDF files are cached under --cache-dir so re-running
-      the script (e.g. after an interruption) does not re-download data
-      that was already fetched.
-    - A full run covers ~70 banks x up to 13 quarters. Most banks will
-      have no consolidated report (only banking groups with subsidiaries
-      file one), but the script still queries every bank/quarter. Expect
-      the full run to take a while (network + PDF parsing bound); use
-      --banks / --start / --end to do a smaller test run first.
+Values are in thousand TRY, taken from the "Toplam" column.
 """
 
 import argparse
@@ -53,14 +47,17 @@ import sys
 import time
 import urllib.parse
 import zipfile
-from dataclasses import dataclass, field
 
-import docx
 import openpyxl
 import pdfplumber
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    import docx  # python-docx; a few banks (e.g. TEB) file .docx reports
+except ImportError:
+    docx = None
 
 try:
     # bddk.gov.tr serves an incomplete certificate chain (missing
@@ -80,75 +77,170 @@ HEADERS = {
     )
 }
 
-FIELD_ORDER = [
-    ("TP_Toplam", "Tüketici Kredileri-TP"),
-    ("TP_Konut", "Konut Kredisi"),
-    ("TP_Tasit", "Taşıt Kredisi"),
-    ("TP_Ihtiyac", "İhtiyaç Kredisi"),
-    ("TP_Diger", "Diğer"),
-    ("YP_Toplam", "Tüketici Kredileri-YP"),
-    ("YP_Konut", "Konut Kredisi"),
-    ("YP_Tasit", "Taşıt Kredisi"),
-    ("YP_Ihtiyac", "İhtiyaç Kredisi"),
-    ("YP_Diger", "Diğer"),
-]
+# --------------------------------------------------------------------------
+# Table registry
+# --------------------------------------------------------------------------
+# Field keys are generic (TP_Toplam, TP_S1..TP_S4, ...) so one parser serves
+# every table; each spec supplies the Excel display label for its sub-items.
+FIELD_KEYS = (["TP_Toplam"] + [f"TP_S{i}" for i in range(1, 5)] +
+              ["YP_Toplam"] + [f"YP_S{i}" for i in range(1, 5)])
+ZERO_RESULT = {k: 0 for k in FIELD_KEYS}
 
-ZERO_RESULT = {key: 0 for key, _ in FIELD_ORDER}
+_DASH = r"[-–—]"
 
-# Verified manual overrides, keyed by (eft_kodu, year, month).
-#
-# These three consolidated reports render the "Tüketici kredileri ..." table
-# in a way the PDF text layer cannot express (Fibabanka 2023Q3: per-glyph
-# raster images; Fibabanka 2024Q1: vector curves; TFKB 2026Q1: letter-spaced
-# text with value columns dumped separately). The pages were rasterized
-# (see bddk_cache/_overrides/*.png) and the 10 template fields read directly
-# from the image. Each block is self-checking: the four sub-items
-# (Konut + Taşıt + İhtiyaç + Diğer) sum exactly to the -TP / -YP total, which
-# assert_overrides_valid() re-verifies at startup so a bad transcription
-# fails loudly. Values are in thousand TRY (Toplam column), matching the
-# normal text-parse output.
+# Labels are matched against a SPACE-STRIPPED key (see label_key), which makes
+# word spacing a non-issue: "Konut Kredisi" (normal), "KonutKredisi" (tight
+# kerning defeats pdfplumber's space detection) and "Kre dileri" (RapidOCR
+# splitting a word across two boxes) all normalize to the same key. Numbers are
+# still read from the original line.
+# Still tolerated explicitly:
+#   * case; ş/s, ı/i, ç/c, ğ/g (OCR drops Turkish diacritics; fonts vary);
+#   * singular vs plural — most write "Konut Kredisi", Garanti "Taşıt Kredileri";
+#   * "İşyeri" vs Garanti's two-word "İş Yeri" (spaces are stripped anyway);
+#   * HSBC's "Otomobil Kredisi" for the vehicle-loan row.
+_WS_RE = re.compile(r"\s+")
+_NL = r"(?![^\W\d_])"  # not followed by a letter (label must end here)
+_KREDI = r"Kredi(?:si|leri)"
+
+
+# Footnote markers are sometimes rendered inside the label word itself, e.g.
+# Emlak Katılım's "Konut Kredis4i". Only digits sandwiched between letters are
+# dropped, so the row's actual figures (bounded by spaces/punctuation) survive.
+_FOOTNOTE_DIGIT_RE = re.compile(r"(?<=[^\W\d_])\d+(?=[^\W\d_])")
+
+
+def label_key(line):
+    """Space-stripped form of a line, used only for label matching."""
+    return _FOOTNOTE_DIGIT_RE.sub("", _WS_RE.sub("", line))
+
+
+# A row whose label is long can wrap, leaving its figures alone on the next
+# line (e.g. Vakıf Katılım's "Tüketici Kredileri-TP" / "54.259 9.954.056
+# 10.008.315"). Only a line that is *nothing but* figures may be borrowed, so
+# we can never steal the next labelled row's numbers.
+_NUMBERS_ONLY_RE = re.compile(r"^[\d.,()\s\-–—]+$")
+
+
+def row_value(lines, idx):
+    """The row's Toplam figure: last number on the line, or on the following
+    figures-only continuation line if the label line carries none."""
+    v = line_last_number(lines[idx])
+    if v is None and idx + 1 < len(lines):
+        nxt = lines[idx + 1].strip()
+        if nxt and _NUMBERS_ONLY_RE.match(nxt):
+            v = line_last_number(nxt)
+    return v
+
+
+KONUT_RE = re.compile(r"^Konut" + _KREDI + _NL, re.IGNORECASE)
+ISYERI_RE = re.compile(r"^[İIi][şs][Yy]eri" + _KREDI + _NL, re.IGNORECASE)
+TASIT_RE = re.compile(r"^(?:Ta[şs][ıi]t|Otomobil)" + _KREDI + _NL, re.IGNORECASE)
+IHTIYAC_RE = re.compile(r"^[İIi]htiya[çc]" + _KREDI + _NL, re.IGNORECASE)
+DIGER_RE = re.compile(r"^Di[ğg]er" + _NL, re.IGNORECASE)
+
+TABLE_SPECS = {
+    "tuketici": {
+        "sheet": "Tüketici Kredileri",
+        # "T\w*ketici" tolerates OCR variants (Tuketici, Tiketici, Tüuketici).
+        "hdr_tp": re.compile(r"^T\w*keticiKredileri" + _DASH + r"TP" + _NL, re.IGNORECASE),
+        "hdr_yp": re.compile(r"^T\w*keticiKredileri" + _DASH + r"YP" + _NL, re.IGNORECASE),
+        "label_tp": "Tüketici Kredileri-TP",
+        "label_yp": "Tüketici Kredileri-YP",
+        "subs": [("Konut Kredisi", KONUT_RE), ("Taşıt Kredisi", TASIT_RE),
+                 ("İhtiyaç Kredisi", IHTIYAC_RE), ("Diğer", DIGER_RE)],
+        # Section title, used to locate the page when OCR is needed.
+        "section": (re.compile(r"t[üu]ketici\s+kredileri", re.IGNORECASE),
+                    re.compile(r"bireysel\s+kredi\s+kart", re.IGNORECASE)),
+    },
+    "taksitli": {
+        "sheet": "Taksitli Ticari Krediler",
+        # Banks differ: "Krediler-TP" (most), "Kredileri-TP" (ICBC),
+        # "Krediler - TP" (HSBC, spaced dash).
+        "hdr_tp": re.compile(r"^TaksitliTicariKredi(?:ler|leri)" + _DASH + r"TP" + _NL, re.IGNORECASE),
+        "hdr_yp": re.compile(r"^TaksitliTicariKredi(?:ler|leri)" + _DASH + r"YP" + _NL, re.IGNORECASE),
+        "label_tp": "Taksitli Ticari Krediler-TP",
+        "label_yp": "Taksitli Ticari Krediler-YP",
+        "subs": [("İşyeri Kredisi", ISYERI_RE), ("Taşıt Kredisi", TASIT_RE),
+                 ("İhtiyaç Kredisi", IHTIYAC_RE), ("Diğer", DIGER_RE)],
+        "section": (re.compile(r"taksitli\s+ticari\s+kredi", re.IGNORECASE),
+                    re.compile(r"kurumsal\s+kredi\s+kart", re.IGNORECASE)),
+    },
+}
+DEFAULT_TABLES = ["tuketici", "taksitli"]
+
+
+def field_order(spec):
+    """[(field_key, excel_label)] in Template.xlsx row order for one table."""
+    out = [("TP_Toplam", spec["label_tp"])]
+    out += [(f"TP_S{i}", spec["subs"][i - 1][0]) for i in range(1, 5)]
+    out += [("YP_Toplam", spec["label_yp"])]
+    out += [(f"YP_S{i}", spec["subs"][i - 1][0]) for i in range(1, 5)]
+    return out
+
+
+def sums_ok(result):
+    """True iff the four sub-items sum to the total, for both -TP and -YP.
+
+    This is the correctness gate: the reports' own arithmetic validates our
+    parse (and any OCR reading) with no external reference.
+    """
+    for cur in ("TP", "YP"):
+        parts = sum(result[f"{cur}_S{i}"] for i in range(1, 5))
+        if result[f"{cur}_Toplam"] != parts:
+            return False
+    return True
+
+
+# Verified manual overrides: MANUAL_OVERRIDES[table][(eft, year, month)].
+# These reports render the table in a way no text layer can express (per-glyph
+# raster images / vector curves / letter-spaced text); values were read from
+# the rendered page and sum-checked. OCR now handles such cases generally, but
+# these stay as exact, audited values.
 MANUAL_OVERRIDES = {
-    # FİBABANKA A.Ş. (EFT 103) — 30.09.2023, p.60 (rendered p60)
-    (103, 2023, 9): {
-        "TP_Toplam": 11119514, "TP_Konut": 81896, "TP_Tasit": 498,
-        "TP_Ihtiyac": 11037120, "TP_Diger": 0,
-        "YP_Toplam": 0, "YP_Konut": 0, "YP_Tasit": 0, "YP_Ihtiyac": 0, "YP_Diger": 0,
+    "tuketici": {
+        # FİBABANKA A.Ş. — 30.09.2023, p.60
+        (103, 2023, 9): {"TP_Toplam": 11119514, "TP_S1": 81896, "TP_S2": 498,
+                         "TP_S3": 11037120, "TP_S4": 0,
+                         "YP_Toplam": 0, "YP_S1": 0, "YP_S2": 0, "YP_S3": 0, "YP_S4": 0},
+        # FİBABANKA A.Ş. — 31.03.2024, p.56
+        (103, 2024, 3): {"TP_Toplam": 11806193, "TP_S1": 67580, "TP_S2": 484,
+                         "TP_S3": 11738129, "TP_S4": 0,
+                         "YP_Toplam": 0, "YP_S1": 0, "YP_S2": 0, "YP_S3": 0, "YP_S4": 0},
+        # TÜRKİYE FİNANS KATILIM BANKASI A.Ş. — 31.03.2026, p.52
+        (206, 2026, 3): {"TP_Toplam": 15012676, "TP_S1": 4589164, "TP_S2": 1597563,
+                         "TP_S3": 8825949, "TP_S4": 0,
+                         "YP_Toplam": 0, "YP_S1": 0, "YP_S2": 0, "YP_S3": 0, "YP_S4": 0},
+        # TÜRKİYE EMLAK KATILIM BANKASI A.Ş. — 31.12.2025, p.93. This PDF draws
+        # every figure one row BELOW its label, so a straight read yields a
+        # blank -TP and shifted sub-items. The report's own grand total
+        # (2.524.793 = 2.512.614 + 8.294 + 3.179 + 706) only reconciles under
+        # the shifted reading, which these de-shifted figures use.
+        (211, 2025, 12): {"TP_Toplam": 2512614, "TP_S1": 2457881, "TP_S2": 43373,
+                          "TP_S3": 11360, "TP_S4": 0,
+                          "YP_Toplam": 0, "YP_S1": 0, "YP_S2": 0, "YP_S3": 0, "YP_S4": 0},
     },
-    # FİBABANKA A.Ş. (EFT 103) — 31.03.2024, p.56 (rendered p56)
-    (103, 2024, 3): {
-        "TP_Toplam": 11806193, "TP_Konut": 67580, "TP_Tasit": 484,
-        "TP_Ihtiyac": 11738129, "TP_Diger": 0,
-        "YP_Toplam": 0, "YP_Konut": 0, "YP_Tasit": 0, "YP_Ihtiyac": 0, "YP_Diger": 0,
-    },
-    # TÜRKİYE FİNANS KATILIM BANKASI A.Ş. (EFT 206) — 31.03.2026, p.52 (rendered p52)
-    (206, 2026, 3): {
-        "TP_Toplam": 15012676, "TP_Konut": 4589164, "TP_Tasit": 1597563,
-        "TP_Ihtiyac": 8825949, "TP_Diger": 0,
-        "YP_Toplam": 0, "YP_Konut": 0, "YP_Tasit": 0, "YP_Ihtiyac": 0, "YP_Diger": 0,
+    "taksitli": {
+        # TÜRKİYE FİNANS KATILIM BANKASI A.Ş. — 31.12.2024, p.100. Letter-spaced
+        # Cari table, so OCR is the only route, and OCR drops the lone "1" in
+        # İhtiyaç Kredileri (5,401 + 1 = 5,402). Read from the rendered page.
+        (206, 2024, 12): {"TP_Toplam": 5402, "TP_S1": 0, "TP_S2": 5401,
+                          "TP_S3": 1, "TP_S4": 0,
+                          "YP_Toplam": 0, "YP_S1": 0, "YP_S2": 0, "YP_S3": 0, "YP_S4": 0},
     },
 }
 
 
 def assert_overrides_valid():
-    """Re-check every manual override's internal consistency at startup.
-
-    Guards against a typo in MANUAL_OVERRIDES: the four consumer-loan
-    sub-items must sum to the corresponding -TP / -YP total.
-    """
-    for (eft, year, month), vals in MANUAL_OVERRIDES.items():
-        for cur in ("TP", "YP"):
-            total = vals[f"{cur}_Toplam"]
-            parts = sum(vals[f"{cur}_{k}"] for k in ("Konut", "Tasit", "Ihtiyac", "Diger"))
-            if total != parts:
-                raise AssertionError(
-                    f"Override {(eft, year, month)} {cur}: sub-items sum to "
-                    f"{parts} but total is {total}"
-                )
+    for table, entries in MANUAL_OVERRIDES.items():
+        for key, vals in entries.items():
+            if set(vals) != set(FIELD_KEYS):
+                raise AssertionError(f"Override {table} {key}: wrong field keys")
+            if not sums_ok(vals):
+                raise AssertionError(f"Override {table} {key}: sub-items do not sum to total")
 
 
 # The 25 banks that actually file consolidated consumer-loan data, in the
-# order requested for the filtered output workbook. Names must match the
-# BankaAdi values returned by KurulusListesiGetir exactly.
+# requested output order. Names must match KurulusListesiGetir exactly.
 WANTED_BANKS = [
     "AKBANK T.A.Ş.",
     "ALBARAKA TÜRK KATILIM BANKASI A.Ş.",
@@ -177,20 +269,21 @@ WANTED_BANKS = [
     "ŞEKERBANK T.A.Ş.",
 ]
 
-# Case-insensitive: some banks' PDFs use lowercase table labels (e.g. Yapı
-# Kredi's "Tüketici kredileri-TP" vs Garanti's "Tüketici Kredileri-TP").
-# Dash class covers '-', en-dash '–', em-dash '—' seen across different
-# banks' report templates (e.g. ING uses "kredileri – TP").
-# Word-gap is \s* (not \s+): some banks' PDFs have tightly-kerned text
-# where pdfplumber extracts no space at all between words (e.g. Albaraka
-# Türk's "TüketiciKredileri-TP", "KonutKredisi").
-_DASH = r"[-–—]"
-TP_HEADER_RE = re.compile(r"^T[üu]ketici\s*Kredileri\s*" + _DASH + r"\s*TP\b", re.IGNORECASE)
-YP_HEADER_RE = re.compile(r"^T[üu]ketici\s*Kredileri\s*" + _DASH + r"\s*YP\b", re.IGNORECASE)
-KONUT_RE = re.compile(r"^Konut\s*Kredisi\b", re.IGNORECASE)
-TASIT_RE = re.compile(r"^Ta[şs][ıi]t\s*Kredisi\b", re.IGNORECASE)
-IHTIYAC_RE = re.compile(r"^[İIi]htiya[çc]\s*Kredisi\b", re.IGNORECASE)
-DIGER_RE = re.compile(r"^Di[ğg]er\b", re.IGNORECASE)
+# Period markers. Every report carries the current table AND a previous-period
+# copy; only "Cari Dönem" may be used. D[öo]nem / [ÖO]nceki tolerate OCR
+# dropping Turkish diacritics.
+CARI_RE = re.compile(r"^CariD[öo]nem", re.IGNORECASE)
+ONCEKI_RE = re.compile(r"^[ÖO]ncekiD[öo]nem", re.IGNORECASE)
+# A period word alone is NOT enough: other notes in the same report have their
+# own "Önceki Dönem ..." headers (e.g. "Önceki Dönem Ticari Tüketici", or the
+# past-due aging table's "Önceki Dönem 31-60 Gün ... Toplam"), and blindly
+# scanning back would attribute one of those to this table. The header that
+# actually governs a maturity-breakdown table always carries the vade columns
+# ("Kısa Vadeli" / "Orta ve Uzun Vadeli"), so require that too...
+VADELI_RE = re.compile(r"Vadeli", re.IGNORECASE)
+# ...and only look a few lines up, since the governing header sits directly
+# above its -TP row (1-2 lines in every report inspected).
+PERIOD_LOOKBACK = 8
 
 NUM_TOKEN_RE = re.compile(r"\(?-?\d[\d,.]*\)?|(?<!\S)-(?!\S)")
 
@@ -229,9 +322,98 @@ def parse_number(tok):
 
 def line_last_number(line):
     toks = NUM_TOKEN_RE.findall(line)
-    if not toks:
+    return parse_number(toks[-1]) if toks else None
+
+
+def _period_of(keys, idx):
+    """Which period block the row at `idx` belongs to: 'cari' | 'onceki' | None.
+
+    Only a *governing* header counts: a period word plus this table's vade
+    columns, within a few lines above. None means the table carries no period
+    header at all (e.g. Fibabanka, whose current table simply comes first).
+    """
+    for j in range(idx - 1, max(-1, idx - 1 - PERIOD_LOOKBACK), -1):
+        key = keys[j]
+        if not VADELI_RE.search(key):
+            continue  # some other note's period header — not ours
+        if ONCEKI_RE.match(key):
+            return "onceki"
+        if CARI_RE.match(key):
+            return "cari"
+    return None
+
+
+def _pick_current_period_tp(keys, spec):
+    """Index of the -TP row of the CURRENT period table, or (None, status).
+
+    Never returns a row belonging to an "Önceki Dönem" block: prefer a row
+    explicitly under "Cari Dönem"; else the first unmarked row (current period
+    comes first); only if every candidate is previous-period do we refuse.
+    """
+    cands = [i for i, k in enumerate(keys) if spec["hdr_tp"].match(k)]
+    if not cands:
+        return None, "TP header not found"
+    marked = [(i, _period_of(keys, i)) for i in cands]
+    for i, p in marked:
+        if p == "cari":
+            return i, "ok"
+    for i, p in marked:
+        if p is None:
+            return i, "ok"
+    return None, "only Önceki Dönem table found (refusing previous-period data)"
+
+
+def parse_lines(lines, spec):
+    """Extract one table's 10 fields from 'label v1 v2 total' lines.
+
+    Serves pdfplumber text, flattened .docx rows and OCR-reconstructed rows
+    alike; the last number on a label's line is the Toplam column. Labels are
+    matched on space-stripped keys; numbers are read from the original lines.
+    """
+    result = dict(ZERO_RESULT)
+    n = len(lines)
+    keys = [label_key(l) for l in lines]
+
+    tp_idx, status = _pick_current_period_tp(keys, spec)
+    if tp_idx is None:
+        return result, status
+    result["TP_Toplam"] = row_value(lines, tp_idx) or 0
+
+    def find_after(start, pattern, window=8):
+        for j in range(start + 1, min(start + 1 + window, n)):
+            if pattern.match(keys[j]):
+                return j
         return None
-    return parse_number(toks[-1])
+
+    idx = tp_idx
+    for i, (_label, pat) in enumerate(spec["subs"], start=1):
+        f = find_after(idx, pat)
+        if f is not None:
+            result[f"TP_S{i}"] = row_value(lines, f) or 0
+            idx = f
+
+    # Find the -YP header, skipping the "-Dövize Endeksli" block that sits
+    # between TP and YP. Stop at "Önceki Dönem": if this period's YP block is
+    # absent we must not fall through into the previous period's numbers.
+    yp_idx = None
+    for j in range(idx + 1, min(idx + 1 + 20, n)):
+        if ONCEKI_RE.match(keys[j]):
+            break
+        if spec["hdr_yp"].match(keys[j]):
+            yp_idx = j
+            break
+    if yp_idx is None:
+        return result, "YP header not found"
+
+    result["YP_Toplam"] = row_value(lines, yp_idx) or 0
+    idx = yp_idx
+    for i, (_label, pat) in enumerate(spec["subs"], start=1):
+        f = find_after(idx, pat)
+        if f is not None:
+            result[f"YP_S{i}"] = row_value(lines, f) or 0
+            idx = f
+
+    return result, "ok"
 
 
 def _pdf_to_lines(pdf_path):
@@ -244,10 +426,8 @@ def _pdf_to_lines(pdf_path):
 
 
 def _docx_to_lines(docx_path):
-    # Flatten every table's rows, in document order, into "label val1 val2
-    # val3" strings so the same line-based parser used for PDFs applies
-    # unchanged. Row adjacency within a table is preserved by processing
-    # tables/rows sequentially.
+    # Flatten every table's rows, in document order, into "label v1 v2 v3"
+    # strings so the same line parser applies unchanged.
     doc = docx.Document(docx_path)
     lines = []
     for table in doc.tables:
@@ -258,62 +438,152 @@ def _docx_to_lines(docx_path):
     return lines
 
 
-def extract_consumer_loans(report_path):
-    """Parse the 'Tüketici kredileri ... ilişkin bilgiler' footnote table.
-
-    Returns (result_dict, status_string). result_dict always has all 10
-    keys; any field that could not be located defaults to 0 per spec.
-    """
+def report_to_lines(report_path):
     if report_path.lower().endswith(".docx"):
-        lines = _docx_to_lines(report_path)
-    else:
-        lines = _pdf_to_lines(report_path)
+        if docx is None:
+            raise RuntimeError("python-docx not installed but report is .docx")
+        return _docx_to_lines(report_path)
+    return _pdf_to_lines(report_path)
 
-    result = dict(ZERO_RESULT)
-    n = len(lines)
 
-    tp_idx = next((i for i, l in enumerate(lines) if TP_HEADER_RE.match(l)), None)
-    if tp_idx is None:
-        return result, "TP header not found (bank likely has no consumer-loan note)"
+# --------------------------------------------------------------------------
+# OCR fallback (RapidOCR — pip-only, no system dependency)
+# --------------------------------------------------------------------------
+_OCR_ENGINE = None
+_OCR_IMPORT_ERROR = None
 
-    result["TP_Toplam"] = line_last_number(lines[tp_idx]) or 0
 
-    def find_after(start, pattern, window=8):
-        for j in range(start + 1, min(start + 1 + window, n)):
-            if pattern.match(lines[j]):
-                return j
-        return None
+def _get_ocr():
+    global _OCR_ENGINE, _OCR_IMPORT_ERROR
+    if _OCR_ENGINE is None and _OCR_IMPORT_ERROR is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+        except Exception as e:  # noqa: BLE001
+            _OCR_IMPORT_ERROR = e
+    return _OCR_ENGINE
 
-    idx = tp_idx
-    for key, pattern in (("TP_Konut", KONUT_RE), ("TP_Tasit", TASIT_RE),
-                          ("TP_Ihtiyac", IHTIYAC_RE), ("TP_Diger", DIGER_RE)):
-        found = find_after(idx, pattern)
-        if found is not None:
-            result[key] = line_last_number(lines[found]) or 0
-            idx = found
 
-    yp_idx = None
-    for j in range(idx + 1, min(idx + 1 + 20, n)):
-        if YP_HEADER_RE.match(lines[j]):
-            yp_idx = j
-            break
-    if yp_idx is None:
-        return result, "YP header not found"
+def _ocr_png_to_lines(png_path):
+    """OCR a page image and rebuild table rows (cluster boxes by y, order by x)."""
+    engine = _get_ocr()
+    if engine is None:
+        raise RuntimeError(f"OCR engine unavailable: {_OCR_IMPORT_ERROR}")
+    result, _ = engine(png_path)
+    if not result:
+        return []
+    items = []
+    for box, text, _score in result:
+        ys = [p[1] for p in box]
+        xs = [p[0] for p in box]
+        items.append((sum(ys) / 4.0, min(xs), text))
+    items.sort()
+    rows, cur, last_y = [], [], None
+    for y, x, txt in items:
+        if last_y is None or abs(y - last_y) < 18:
+            cur.append((x, txt))
+        else:
+            rows.append(sorted(cur))
+            cur = [(x, txt)]
+        last_y = y
+    if cur:
+        rows.append(sorted(cur))
+    return [normalize_line(" ".join(t for _x, t in r)) for r in rows]
 
-    result["YP_Toplam"] = line_last_number(lines[yp_idx]) or 0
-    idx = yp_idx
-    for key, pattern in (("YP_Konut", KONUT_RE), ("YP_Tasit", TASIT_RE),
-                          ("YP_Ihtiyac", IHTIYAC_RE), ("YP_Diger", DIGER_RE)):
-        found = find_after(idx, pattern)
-        if found is not None:
-            result[key] = line_last_number(lines[found]) or 0
-            idx = found
 
-    return result, "ok"
+def _candidate_pages(pdf_path, spec):
+    """Pages holding this table's section, plus the next (tables can spill).
+
+    Requires both section-title phrases on the SAME page: that pinpoints the
+    table page and avoids earlier prose pages that merely mention the topic.
+    """
+    sec1, sec2 = spec["section"]
+    pages = set()
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            npages = len(pdf.pages)
+            for i, page in enumerate(pdf.pages):
+                t = page.extract_text() or ""
+                if sec1.search(t) and sec2.search(t):
+                    pages.add(i)
+                    if i + 1 < npages:
+                        pages.add(i + 1)
+    except Exception:
+        return []
+    return sorted(pages)[:4]
+
+
+def extract_with_ocr(pdf_path, tag, ocr_dir, spec, dpi=300):
+    """Render the section page(s) and OCR them. Accepts the numbers only if the
+    sum-check passes and the TP total is positive."""
+    import fitz  # PyMuPDF
+
+    candidates = _candidate_pages(pdf_path, spec)
+    if not candidates:
+        return dict(ZERO_RESULT), "ocr-no-section-page"
+
+    os.makedirs(ocr_dir, exist_ok=True)
+    doc = fitz.open(pdf_path)
+    all_lines = []
+    try:
+        for pno in candidates:
+            if pno >= len(doc):
+                continue
+            png = os.path.join(ocr_dir, f"{tag}_p{pno}.png")
+            doc[pno].get_pixmap(dpi=dpi).save(png)
+            all_lines.extend(_ocr_png_to_lines(png))
+    finally:
+        doc.close()
+
+    result, status = parse_lines(all_lines, spec)
+    if result["TP_Toplam"] <= 0:
+        return result, f"ocr-parse-failed ({status}; page images saved)"
+    if not sums_ok(result):
+        return result, "ocr-sumcheck-failed (page images saved for manual read)"
+    return result, "ok_ocr"
+
+
+def extract_table(report_path, eft, year, month, ocr_dir, table, spec, lines=None):
+    """Full chain for one bank/quarter/table: override -> text/docx -> OCR."""
+    override = MANUAL_OVERRIDES.get(table, {}).get((eft, year, month))
+    if override is not None:
+        return dict(override), "manual_override"
+
+    if lines is None:
+        lines = report_to_lines(report_path)
+    result, status = parse_lines(lines, spec)
+    if status == "ok" and sums_ok(result):
+        return result, "ok"
+
+    # Either the block wasn't found, or it was found but its own arithmetic
+    # doesn't hold — the latter means we mis-read something. (TFKB's PDFs, for
+    # example, inject spaces inside numbers: "2 3,640,299" reads back as
+    # 3,640,299.) Rendering the page and OCR'ing it sidesteps a broken text
+    # layer entirely, and we only trust the result if it sum-checks.
+    tag = f"{table}_{eft}_{year}_{month:02d}"
+    try:
+        ocr_result, ocr_status = extract_with_ocr(report_path, tag, ocr_dir, spec)
+    except Exception as e:  # noqa: BLE001
+        if status == "ok":
+            return result, f"needs_review: text sum-check failed, OCR unavailable ({e})"
+        return dict(ZERO_RESULT), f"needs_review: text '{status}', OCR unavailable ({e})"
+    if ocr_status == "ok_ocr":
+        return ocr_result, "ok_ocr"
+    if "no-section-page" in ocr_status and status != "ok":
+        # No such note in this report at all -> legitimately zero.
+        return dict(ZERO_RESULT), f"no_note ({status})"
+    if status == "ok":
+        # The block was found but its own arithmetic doesn't hold and OCR could
+        # not confirm a better reading, so something is mis-read (Emlak's
+        # 2025Q4 PDF, for instance, renders every figure one row below its
+        # label). Emit 0 and flag rather than write numbers we cannot validate.
+        return dict(ZERO_RESULT), f"needs_review: sum-check failed, OCR could not confirm ({ocr_status})"
+    return dict(ZERO_RESULT), f"needs_review: {ocr_status}"
 
 
 def get_banks(session):
-    r = session.post(f"{BASE}/Home/KurulusListesiGetir", data={"kurulusTuruId": 1, "kurulusGrubuId": ""})
+    r = session.post(f"{BASE}/Home/KurulusListesiGetir",
+                     data={"kurulusTuruId": 1, "kurulusGrubuId": ""})
     r.raise_for_status()
     banks = r.json()
     return sorted(banks, key=lambda b: b["BankaAdi"])
@@ -324,14 +594,9 @@ KONSOLIDE_FILE_RE = re.compile(r"KONSOLIDE-(\d{4})-(\d{2})\.zip$", re.IGNORECASE
 
 
 def get_year_reports(session, eft_kodu, year, rapor_tipi="KONSOLIDE"):
-    """Returns {month: raporUrl} for one bank/year via a single request."""
-    params = {
-        "KurulusTuru": 1,
-        "EFTKodu": eft_kodu,
-        "RaporTipi": rapor_tipi,
-        "DonemYil": year,
-        "DonemAy": 0,
-    }
+    """{month: raporUrl} for one bank/year via a single request."""
+    params = {"KurulusTuru": 1, "EFTKodu": eft_kodu, "RaporTipi": rapor_tipi,
+              "DonemYil": year, "DonemAy": 0}
     r = session.get(f"{BASE}/Home/SorguSonuc", params=params)
     r.raise_for_status()
     out = {}
@@ -343,8 +608,29 @@ def get_year_reports(session, eft_kodu, year, rapor_tipi="KONSOLIDE"):
     return out
 
 
+def _find_report_file(root_dir):
+    # Some archives hold more than one PDF/DOCX (e.g. a short responsibility
+    # statement beside the full statements). The real report is by far the
+    # largest. A few banks (e.g. TEB) file .docx instead of PDF.
+    candidates = []
+    for root, _dirs, files in os.walk(root_dir):
+        for fn in files:
+            if fn.lower().endswith((".pdf", ".docx")):
+                path = os.path.join(root, fn)
+                candidates.append((os.path.getsize(path), path))
+    return max(candidates)[1] if candidates else None
+
+
+def _find_ext(root_dir, ext):
+    for root, _dirs, files in os.walk(root_dir):
+        for fn in files:
+            if fn.lower().endswith(ext):
+                return os.path.join(root, fn)
+    return None
+
+
 def download_pdf(session, rapor_url, cache_dir, cache_key):
-    """Downloads+extracts the report ZIP (cached), returns path to the PDF."""
+    """Download+extract the report (cached); returns path to the PDF/DOCX."""
     os.makedirs(cache_dir, exist_ok=True)
     pdf_dir = os.path.join(cache_dir, cache_key)
     marker = os.path.join(pdf_dir, ".pdf_path")
@@ -354,27 +640,22 @@ def download_pdf(session, rapor_url, cache_dir, cache_key):
         if p and os.path.exists(p):
             return p
 
-    # rapor_url comes from the search-results HTML already percent-encoded
-    # (e.g. "~%2FDosya%2F...zip"); requests.params would re-encode the '%'
-    # signs and double-encode it, so decode first and let requests encode once.
+    # rapor_url arrives already percent-encoded ("~%2FDosya%2F...zip");
+    # requests would re-encode the '%', so decode first and let it encode once.
     decoded_url = urllib.parse.unquote(rapor_url)
     r = session.get(f"{BASE}/Home/DosyaIndir", params={"raporUrl": decoded_url}, timeout=120)
     r.raise_for_status()
     os.makedirs(pdf_dir, exist_ok=True)
 
     if r.content[:4] == b"%PDF":
-        # Some reports are served as a raw PDF despite the .zip filename/
-        # application/zip content-type (e.g. HSBC).
+        # Some reports are a raw PDF despite the .zip name/content-type (HSBC).
         pdf_path = os.path.join(pdf_dir, "report.pdf")
         with open(pdf_path, "wb") as f:
             f.write(r.content)
     else:
         with zipfile.ZipFile(io.BytesIO(r.content)) as z:
             z.extractall(pdf_dir)
-
-        # Some archives are a zip-within-a-zip (e.g. Nurol, TEB): the outer
-        # zip's only entry is itself a .zip, not a report file. Unwrap up
-        # to a few levels until we find a PDF or DOCX.
+        # Some archives are a zip-within-a-zip (Nurol, TEB).
         for _ in range(3):
             pdf_path = _find_report_file(pdf_dir)
             if pdf_path:
@@ -388,42 +669,15 @@ def download_pdf(session, rapor_url, cache_dir, cache_key):
 
     if pdf_path is None:
         raise RuntimeError(f"No PDF/DOCX report found inside archive for {rapor_url}")
-
     with open(marker, "w") as f:
         f.write(pdf_path)
     return pdf_path
 
 
-def _find_report_file(root_dir):
-    # Some archives contain more than one PDF/DOCX (e.g. a short
-    # "responsibility statement" alongside the full financial statements,
-    # as with Nurol). The full financial-statement report is always by far
-    # the largest file, so picking the largest candidate reliably selects
-    # the right one. A handful of banks (e.g. TEB) file .docx instead of PDF.
-    candidates = []
-    for root, _dirs, files in os.walk(root_dir):
-        for fn in files:
-            if fn.lower().endswith((".pdf", ".docx")):
-                path = os.path.join(root, fn)
-                candidates.append((os.path.getsize(path), path))
-    if not candidates:
-        return None
-    return max(candidates)[1]
-
-
-def _find_ext(root_dir, ext):
-    for root, _dirs, files in os.walk(root_dir):
-        for fn in files:
-            if fn.lower().endswith(ext):
-                return os.path.join(root, fn)
-    return None
-
-
 def quarter_range(start, end):
     """start/end like '2023Q1' -> ordered list of (year, month, label)."""
     def parse(q):
-        y, qn = int(q[:4]), int(q[5])
-        return y, qn
+        return int(q[:4]), int(q[5])
 
     sy, sq = parse(start)
     ey, eq = parse(end)
@@ -433,13 +687,13 @@ def quarter_range(start, end):
         out.append((y, q * 3, f"{y}Q{q}"))
         q += 1
         if q > 4:
-            q = 1
-            y += 1
+            q, y = 1, y + 1
     return out
 
 
-# Layout/styling copied from Template.xlsx: labels in column F, quarters
-# starting at column G, bold+yellow bank-name/header rows, plain field rows.
+# --------------------------------------------------------------------------
+# Workbook — one sheet per table, Template.xlsx layout
+# --------------------------------------------------------------------------
 LABEL_COL = 6   # F
 FIRST_Q_COL = 7  # G
 
@@ -450,11 +704,7 @@ YELLOW_FILL = openpyxl.styles.PatternFill(fill_type="solid", fgColor="FFFFFF00")
 VALUE_ALIGN = openpyxl.styles.Alignment(horizontal="left")
 
 
-def build_workbook(quarters, bank_results, bank_order):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
-
+def _write_sheet(ws, spec, quarters, bank_results, bank_order):
     row = 1
     first_bank = True
     for bank_name in bank_order:
@@ -462,18 +712,15 @@ def build_workbook(quarters, bank_results, bank_order):
         name_cell.font = HEADER_FONT
         name_cell.fill = YELLOW_FILL
         if first_bank:
-            # Template fuses the quarter header labels into the first
-            # bank's name row (e.g. F46='GARANTİ', G46='2023 Q1', ...).
-            for j, (y, q3, _label) in enumerate(quarters):
+            # Template fuses the quarter headers into the first bank's row.
+            for j, (y, q3, _lbl) in enumerate(quarters):
                 qcell = ws.cell(row=row, column=FIRST_Q_COL + j, value=f"{y} Q{q3 // 3}")
                 qcell.font = QUARTER_FONT
                 qcell.fill = YELLOW_FILL
             first_bank = False
         row += 1
-
-        for key, field_label in FIELD_ORDER:
-            label_cell = ws.cell(row=row, column=LABEL_COL, value=field_label)
-            label_cell.font = FIELD_FONT
+        for key, label in field_order(spec):
+            ws.cell(row=row, column=LABEL_COL, value=label).font = FIELD_FONT
             for j, (_y, _m, qlabel) in enumerate(quarters):
                 val = bank_results.get(bank_name, {}).get(qlabel, ZERO_RESULT)[key]
                 vcell = ws.cell(row=row, column=FIRST_Q_COL + j, value=val)
@@ -481,107 +728,131 @@ def build_workbook(quarters, bank_results, bank_order):
                 vcell.alignment = VALUE_ALIGN
                 vcell.number_format = "#,##0"
             row += 1
-
     ws.column_dimensions[openpyxl.utils.get_column_letter(LABEL_COL)].width = 35.5
     for j in range(len(quarters)):
         ws.column_dimensions[openpyxl.utils.get_column_letter(FIRST_Q_COL + j)].width = 17
-
     ws.freeze_panes = ws.cell(row=2, column=FIRST_Q_COL).coordinate
 
+
+def build_workbook(tables, quarters, results_by_table, bank_order):
+    """One workbook, one sheet per table (their sub-items differ)."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for table in tables:
+        spec = TABLE_SPECS[table]
+        ws = wb.create_sheet(title=spec["sheet"])
+        _write_sheet(ws, spec, quarters, results_by_table[table], bank_order)
     return wb
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--start", default="2023Q1", help="First quarter, e.g. 2023Q1")
     ap.add_argument("--end", default="2026Q1", help="Last quarter, e.g. 2026Q1")
-    ap.add_argument("--output", default="BDDK_Konsolide_Tuketici_Kredileri.xlsx")
+    ap.add_argument("--tables", default=",".join(DEFAULT_TABLES),
+                    help="Comma list: tuketici,taksitli (default: both -> two sheets)")
+    ap.add_argument("--output", default=None)
     ap.add_argument("--cache-dir", default="bddk_cache")
-    ap.add_argument("--banks", type=int, default=None, help="Limit number of banks (for testing)")
+    ap.add_argument("--ocr-dir", default="_ocr_pages")
+    ap.add_argument("--banks", type=int, default=None, help="Limit bank count (testing)")
     ap.add_argument("--only-banks", action="store_true",
-                    help="Restrict output to the 25 WANTED_BANKS, in that order.")
-    ap.add_argument("--delay", type=float, default=0.4, help="Delay in seconds between HTTP requests")
+                    help="Restrict to the 25 WANTED_BANKS, in that order.")
+    ap.add_argument("--delay", type=float, default=0.4)
     ap.add_argument("--log", default="bddk_scrape_log.jsonl")
     args = ap.parse_args()
 
+    tables = [t.strip() for t in args.tables.split(",") if t.strip()]
+    for t in tables:
+        if t not in TABLE_SPECS:
+            raise SystemExit(f"Unknown table {t!r}; choose from {list(TABLE_SPECS)}")
     assert_overrides_valid()
 
     quarters = quarter_range(args.start, args.end)
     years_needed = sorted({y for y, _m, _l in quarters})
+    out_path = args.output or f"BDDK_Konsolide_25Banks_{args.start}-{args.end}.xlsx"
 
     session = make_session()
-
     print("Fetching bank list...")
     banks = get_banks(session)
     if args.only_banks:
         by_name = {b["BankaAdi"]: b for b in banks}
         missing = [n for n in WANTED_BANKS if n not in by_name]
         if missing:
-            raise SystemExit("WANTED_BANKS not found in bank list: " + "; ".join(missing))
+            raise SystemExit("WANTED_BANKS not found: " + "; ".join(missing))
         banks = [by_name[n] for n in WANTED_BANKS]
     if args.banks:
         banks = banks[: args.banks]
-    print(f"{len(banks)} banks to process, {len(quarters)} quarters each "
-          f"({args.start} .. {args.end}).")
 
-    bank_results = {}
     bank_order = [b["BankaAdi"] for b in banks]
+    print(f"{len(banks)} banks x {len(quarters)} quarters x {len(tables)} table(s) "
+          f"({args.start}..{args.end}); tables: {', '.join(tables)}")
+
+    results = {t: {} for t in tables}
+    needs_review = []
     logf = open(args.log, "a", encoding="utf-8")
 
     for bi, bank in enumerate(banks, 1):
         eft = bank["EFTKodu"]
         name = bank["BankaAdi"]
         print(f"[{bi}/{len(banks)}] {name} (EFT {eft})")
-        bank_results[name] = {}
+        for t in tables:
+            results[t][name] = {}
 
         year_reports = {}
         for year in years_needed:
             try:
                 year_reports[year] = get_year_reports(session, eft, year)
-            except Exception as e:
-                print(f"  WARN: could not fetch report index for {year}: {e}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  WARN: report index fetch failed for {year}: {e}")
                 year_reports[year] = {}
             time.sleep(args.delay)
 
         for year, month, qlabel in quarters:
-            override = MANUAL_OVERRIDES.get((eft, year, month))
-            if override is not None:
-                # Verified figures read from the rendered page image for the
-                # few reports whose table isn't in the PDF text layer.
-                bank_results[name][qlabel] = dict(override)
-                logf.write(json.dumps({"bank": name, "eft": eft, "quarter": qlabel,
-                                        "status": "manual_override"}, ensure_ascii=False) + "\n")
-                print(f"  OVERRIDE {qlabel}: using verified values from rendered image")
-                continue
-
             rapor_url = year_reports.get(year, {}).get(month)
             if not rapor_url:
-                bank_results[name][qlabel] = dict(ZERO_RESULT)
+                for t in tables:
+                    results[t][name][qlabel] = dict(ZERO_RESULT)
                 logf.write(json.dumps({"bank": name, "eft": eft, "quarter": qlabel,
-                                        "status": "no_consolidated_report"}, ensure_ascii=False) + "\n")
+                                       "table": "*", "status": "no_consolidated_report"},
+                                      ensure_ascii=False) + "\n")
                 continue
             try:
                 cache_key = f"{eft}_{year}_{month:02d}"
-                pdf_path = download_pdf(session, rapor_url, args.cache_dir, cache_key)
-                result, status = extract_consumer_loans(pdf_path)
-                bank_results[name][qlabel] = result
-                logf.write(json.dumps({"bank": name, "eft": eft, "quarter": qlabel,
-                                        "status": status}, ensure_ascii=False) + "\n")
-                if status != "ok":
-                    print(f"  NOTE {qlabel}: {status} -> missing fields default to 0")
-            except Exception as e:
-                print(f"  ERROR {qlabel}: {e} -> defaulting to 0")
-                bank_results[name][qlabel] = dict(ZERO_RESULT)
-                logf.write(json.dumps({"bank": name, "eft": eft, "quarter": qlabel,
-                                        "status": f"error: {e}"}, ensure_ascii=False) + "\n")
+                report_path = download_pdf(session, rapor_url, args.cache_dir, cache_key)
+                # Read the report once, parse every requested table from it.
+                lines = report_to_lines(report_path)
+                for t in tables:
+                    res, status = extract_table(report_path, eft, year, month,
+                                                args.ocr_dir, t, TABLE_SPECS[t], lines=lines)
+                    results[t][name][qlabel] = res
+                    logf.write(json.dumps({"bank": name, "eft": eft, "quarter": qlabel,
+                                           "table": t, "status": status},
+                                          ensure_ascii=False) + "\n")
+                    if status.startswith("needs_review"):
+                        needs_review.append((name, qlabel, t, status))
+                        print(f"  NEEDS REVIEW {qlabel} [{t}]: {status}")
+                    elif status == "ok_ocr":
+                        print(f"  OCR {qlabel} [{t}]: read from image, sum-check passed")
+            except Exception as e:  # noqa: BLE001
+                print(f"  ERROR {qlabel}: {e} -> 0")
+                for t in tables:
+                    results[t][name][qlabel] = dict(ZERO_RESULT)
+                    logf.write(json.dumps({"bank": name, "eft": eft, "quarter": qlabel,
+                                           "table": t, "status": f"error: {e}"},
+                                          ensure_ascii=False) + "\n")
             time.sleep(args.delay)
 
         # Save incrementally so a long run can be interrupted safely.
-        wb = build_workbook(quarters, bank_results, bank_order[:bi])
-        wb.save(args.output)
+        build_workbook(tables, quarters, results, bank_order[:bi]).save(out_path)
 
     logf.close()
-    print(f"Done. Wrote {args.output}")
+    print(f"\nDone. Wrote {out_path}  (sheets: "
+          f"{', '.join(TABLE_SPECS[t]['sheet'] for t in tables)})")
+    if needs_review:
+        print(f"NEEDS MANUAL REVIEW ({len(needs_review)}) — page images in {args.ocr_dir}/:")
+        for name, q, t, st in needs_review:
+            print(f"  - {name} {q} [{t}]: {st}")
 
 
 if __name__ == "__main__":

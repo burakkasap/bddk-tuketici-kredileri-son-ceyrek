@@ -1,7 +1,10 @@
 # Dependencies for the historical backfill script (bddk_consolidated_loans.py).
-# The recurring quarterly tool has its own (adds OCR): see bddk_quarterly/requirements.txt
+# The recurring quarterly tool uses the same set: bddk_quarterly/requirements.txt
 requests
 truststore
 openpyxl
 pdfplumber
 python-docx
+pymupdf                 # render pages when a table isn't in the text layer
+rapidocr-onnxruntime    # pip-only OCR (no Tesseract/Homebrew needed)
+pillow
