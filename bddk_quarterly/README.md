@@ -1,7 +1,7 @@
-# BDDK Quarterly Loan-Breakdown Extractor (latest quarter, 25 banks)
+# BDDK Quarterly Loan-Breakdown Extractor (latest quarter, 26 banks)
 
 Each quarter, re-run this tool to pull **only the latest available quarter**'s
-consolidated loan breakdowns for the **25 tracked banks**, in the Template.xlsx
+consolidated loan breakdowns for the **26 tracked banks**, in the Template.xlsx
 layout. **You never edit the code between quarters** — when 2026-Q2 is published,
 just run it again and it picks 2026-Q2 up automatically; same for 2026-Q3.
 
@@ -50,8 +50,8 @@ output/run_2026Q2.jsonl           # per-bank/table status log
 
 ## What each run does
 
-1. Scans the current and previous year for all 25 banks and picks the **newest
-   quarter any of them has filed**. It prints how many of the 25 have a report and
+1. Scans the current and previous year for all 26 banks and picks the **newest
+   quarter any of them has filed**. It prints how many of the 26 have a report and
    **warns if fewer than half** have filed yet (filing is staggered — if you ran too
    early, re-run later or pass `--quarter`).
 2. Downloads each bank's consolidated report once (cached under `bddk_cache/`) and

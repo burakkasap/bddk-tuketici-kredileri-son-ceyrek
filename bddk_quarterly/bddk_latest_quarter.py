@@ -236,6 +236,7 @@ WANTED_BANKS = [
     "ANADOLUBANK A.Ş.",
     "BURGAN BANK A.Ş.",
     "DENİZBANK A.Ş.",
+    "ENPARA BANK A.Ş.",
     "FİBABANKA A.Ş.",
     "HAYAT FİNANS KATILIM BANKASI A.Ş.",
     "HSBC BANK A.Ş.",

@@ -36,7 +36,7 @@ One-off scrape of a quarter **range**. Produced the workbooks in this repo:
 
 ```bash
 pip install -r requirements.txt
-python3 bddk_consolidated_loans.py --only-banks              # 25 banks, both tables
+python3 bddk_consolidated_loans.py --only-banks              # 26 banks, both tables
 python3 bddk_consolidated_loans.py --tables taksitli         # one sheet only
 python3 bddk_consolidated_loans.py --start 2023Q1 --end 2026Q1
 ```
@@ -44,7 +44,7 @@ python3 bddk_consolidated_loans.py --start 2023Q1 --end 2026Q1
 ### 2. Recurring quarterly tool — [`bddk_quarterly/`](bddk_quarterly/)
 
 Run each quarter with **no code changes** to pull **only the latest available quarter**
-for the 25 tracked banks. Auto-detects the newest published quarter.
+for the 26 tracked banks. Auto-detects the newest published quarter.
 
 ```bash
 cd bddk_quarterly
@@ -54,6 +54,39 @@ python3 bddk_latest_quarter.py --quarter 2026Q2   # or pin one
 ```
 
 See [`bddk_quarterly/README.md`](bddk_quarterly/README.md) for details.
+
+### 3. Long-format converter — [`to_donem_x_banka.py`](to_donem_x_banka.py)
+
+Both extractors write one block of 10 rows per bank, one column per quarter. This
+converts that into the single-sheet **Dönem x Banka** layout used for reporting —
+one row per *quarter x kredi tipi x kategori*, one column per bank, a `TOPLAM`
+column, and **TP and YP summed** into one figure:
+
+| Dönem | Kredi Tipi | Kategori | AKBANK T.A.Ş. | ... | TOPLAM |
+|---|---|---|---|---|---|
+| 2023 Q1 | Tüketici | Tüketici Kredileri (TP+YP) | 116540245 | ... | `=SUM(D2:U2)` |
+| 2023 Q1 | Tüketici | Konut Kredisi | 24522089 | ... | `=SUM(D3:U3)` |
+
+```bash
+# Rebuild the whole history:
+python3 to_donem_x_banka.py \
+    --source BDDK_Konsolide_25Banks_2023Q1-2026Q1.xlsx \
+    --out Tuketici_Ticari_Krediler_Donem_x_Banka.xlsx
+
+# Append a newly extracted quarter, keeping the existing columns and ordering:
+python3 to_donem_x_banka.py \
+    --source bddk_quarterly/output/BDDK_25Banks_2026Q2.xlsx \
+    --into Tuketici_Ticari_Krediler_Donem_x_Banka.xlsx \
+    --out  Tuketici_Ticari_Krediler_Donem_x_Banka.xlsx
+
+# Add a bank column the sheet does not have yet (placed in canonical order,
+# back-filled with 0 for earlier quarters):
+python3 to_donem_x_banka.py --source ... --into ... --out ... \
+    --add-bank "ENPARA BANK A.Ş."
+```
+
+The sheet carries the **18 conventional banks** by default — the tracked banks less
+the katılım banks. `--banks` overrides that for a fresh build.
 
 ## How the extraction stays honest
 
@@ -82,12 +115,22 @@ all corrected in the two-sheet workbook:
 | Emlak Katılım (2 quarters) | footnote digit inside a label (`Kredis4i`); one PDF draws every figure a row below its label | corrected / verified override |
 | Vakıf Katılım (1 quarter) | `-TP` total blank — its figures wrap onto the next line | actual figures |
 
+## Banks that file no consolidated report
+
+`ENPARA BANK A.Ş.` is tracked but has **no consolidated report for any quarter**
+(2023 Q1 – 2026 Q1, confirmed in `bddk_scrape_log.jsonl`: `no_consolidated_report`
+for all 13). It has no subsidiaries to consolidate, so it files only solo
+(unconsolidated) statements, which this portal path does not serve. Under the
+project rule its column is therefore `0` throughout — not a scrape failure. It stays
+in the list so that it is picked up automatically if it ever starts filing one.
+
 ## Repo contents
 
 | Path | What |
 |---|---|
 | `bddk_consolidated_loans.py` | Historical range backfill (both tables) |
 | `bddk_quarterly/bddk_latest_quarter.py` | Recurring latest-quarter tool |
+| `to_donem_x_banka.py` | Converts either output into the long Dönem x Banka sheet |
 | `Template.xlsx` | Target output layout |
 | `BDDK_Konsolide_25Banks_2023Q1-2026Q1.xlsx` | **Main deliverable** — both tables, two sheets |
 | `BDDK_Konsolide_Tuketici_Kredileri*.xlsx` | Earlier Tüketici-only runs |
