@@ -1,0 +1,93 @@
+{
+  "_note": "2026 Q3 figures as PRINTED in each bank's own report. All four PDFs and the QNB report declare Milyon TL, so unit=million and the builder multiplies by 1000 to reach the workbook's Bin TL. Each block is sum-checked: subs == total.",
+  "ENPARA BANK A.Ş.": {
+    "unit": "million",
+    "source": "EnparaBank_30.09.2026_BDDK_Rapor.pdf (repo parser, sum-check PASS)",
+    "Tüketici": {
+      "total": 61479,
+      "Konut Kredisi": 0,
+      "Taşıt Kredisi": 0,
+      "İhtiyaç Kredisi": 61479,
+      "Diğer": 0
+    },
+    "Ticari": {
+      "total": 3284,
+      "İşyeri Kredisi": 0,
+      "Taşıt Kredisi": 0,
+      "İhtiyaç Kredisi": 3284,
+      "Diğer": 0
+    }
+  },
+  "FİBABANKA A.Ş.": {
+    "unit": "million",
+    "source": "Fibabanka_Konsolide_BDDK_Dipnotlar_30092026_Final.pdf p56 (repo parser, sum-check PASS)",
+    "Tüketici": {
+      "total": 20630,
+      "Konut Kredisi": 19,
+      "Taşıt Kredisi": 3,
+      "İhtiyaç Kredisi": 20608,
+      "Diğer": 0
+    },
+    "Ticari": {
+      "total": 21294,
+      "İşyeri Kredisi": 0,
+      "Taşıt Kredisi": 594,
+      "İhtiyaç Kredisi": 20700,
+      "Diğer": 0
+    }
+  },
+  "ICBC TURKEY BANK A.Ş.": {
+    "unit": "million",
+    "source": "ICBC_Turkey_Bank_Konsolide_FT_ve_Dipnotlar_30.09.2026.pdf (repo parser, sum-check PASS; Ticari is TP 23 + YP 26062)",
+    "Tüketici": {
+      "total": 63,
+      "Konut Kredisi": 49,
+      "Taşıt Kredisi": 0,
+      "İhtiyaç Kredisi": 14,
+      "Diğer": 0
+    },
+    "Ticari": {
+      "total": 26085,
+      "İşyeri Kredisi": 0,
+      "Taşıt Kredisi": 0,
+      "İhtiyaç Kredisi": 15759,
+      "Diğer": 10326
+    }
+  },
+  "QNB BANK A.Ş.": {
+    "unit": "million",
+    "source": "QNB Bank 30.09.2026 Konsolide, p73 + p75 screenshots, Cari Dönem/Toplam column (read by hand, sum-check PASS; its Önceki Dönem Ticari TP 95.884 matches the sheet's 2025 Q4 QNB figure, confirming period and unit)",
+    "Tüketici": {
+      "total": 160658,
+      "Konut Kredisi": 7980,
+      "Taşıt Kredisi": 0,
+      "İhtiyaç Kredisi": 152678,
+      "Diğer": 0
+    },
+    "Ticari": {
+      "total": 121876,
+      "İşyeri Kredisi": 3969,
+      "Taşıt Kredisi": 2881,
+      "İhtiyaç Kredisi": 115026,
+      "Diğer": 0
+    }
+  },
+  "TÜRKİYE İŞ BANKASI A.Ş.": {
+    "unit": "million",
+    "source": "ISBTR-30092026-Konsolide_Finansal_Rapor.pdf (repo parser, sum-check PASS; report states presentation currency changed from bin TL to milyon TL). TP+YP combined.",
+    "Tüketici": {
+      "total": 317122,
+      "Konut Kredisi": 111897,
+      "Taşıt Kredisi": 4911,
+      "İhtiyaç Kredisi": 200314,
+      "Diğer": 0
+    },
+    "Ticari": {
+      "total": 308267,
+      "İşyeri Kredisi": 3629,
+      "Taşıt Kredisi": 35161,
+      "İhtiyaç Kredisi": 252673,
+      "Diğer": 16804
+    }
+  }
+}
